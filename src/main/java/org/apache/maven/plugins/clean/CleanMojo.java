@@ -20,6 +20,11 @@ package org.apache.maven.plugins.clean;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Objects;
+import org.apache.maven.api.Project;
 
 import org.apache.maven.api.Session;
 import org.apache.maven.api.di.Inject;
@@ -28,6 +33,7 @@ import org.apache.maven.api.plugin.MojoException;
 import org.apache.maven.api.plugin.annotations.Mojo;
 import org.apache.maven.api.plugin.annotations.Parameter;
 import org.apache.maven.api.services.PathMatcherFactory;
+import org.apache.maven.api.services.ProjectManager;
 
 /**
  * Goal which cleans the build.
@@ -46,41 +52,31 @@ import org.apache.maven.api.services.PathMatcherFactory;
  */
 @Mojo(name = "clean")
 public class CleanMojo implements org.apache.maven.api.plugin.Mojo {
-
-    public static final String FAST_MODE_BACKGROUND = "background";
-
-    public static final String FAST_MODE_AT_END = "at-end";
-
-    public static final String FAST_MODE_DEFER = "defer";
-
+    /**
+     * The logger where to send information about what the plugin is doing.
+     */
     @Inject
     private Log logger;
 
     /**
-     * This is where build results go.
+     * The directory where build results went.
      */
     @Parameter(defaultValue = "${project.build.directory}", readonly = true, required = true)
     private Path directory;
 
     /**
-     * This is where compiled classes go.
+     * The directory where compiled main classes went. This is usually a sub-directory
+     * of {@link #directory}, but could be configured by the user to another location.
      */
     @Parameter(defaultValue = "${project.build.outputDirectory}", readonly = true, required = true)
     private Path outputDirectory;
 
     /**
-     * This is where compiled test classes go.
+     * The directory where compiled test classes went. This is usually a sub-directory
+     * of {@link #directory}, but could be configured by the user to another location.
      */
     @Parameter(defaultValue = "${project.build.testOutputDirectory}", readonly = true, required = true)
     private Path testOutputDirectory;
-
-    /**
-     * This is where the site plugin generates its pages.
-     *
-     * @since 2.1.1
-     */
-    @Parameter(defaultValue = "${project.build.outputDirectory}", readonly = true, required = true)
-    private Path reportDirectory;
 
     /**
      * Sets whether the plugin runs in verbose mode. As of plugin version 2.3, the default value is derived from Maven's
@@ -192,13 +188,13 @@ public class CleanMojo implements org.apache.maven.api.plugin.Mojo {
     private boolean fast;
 
     /**
-     * When fast clean is specified, the {@code fastDir} property will be used as the location where directories
-     * to be deleted will be moved prior to background deletion.  If not specified, the
-     * {@code ${maven.multiModuleProjectDirectory}/target/.clean} directory will be used.
+     * When fast clean is enabled,
+     * the location where directories to be deleted will be moved prior to background deletion.
+     * If not specified, the {@code ${maven.multiModuleProjectDirectory}/target/.clean} directory will be used.
      * If the {@code ${build.directory}} has been modified, you'll have to adjust this property explicitly.
      * In order for fast clean to work correctly, this directory and the various directories that will be deleted
      * should usually reside on the same volume.  The exact conditions are system-dependent though, but if an atomic
-     * move is not supported, the standard deletion mechanism will be used.
+     * move is not supported, the immediate deletion mechanism will be used.
      *
      * @since 3.2
      * @see #fast
@@ -216,11 +212,20 @@ public class CleanMojo implements org.apache.maven.api.plugin.Mojo {
      * @since 3.2
      * @see #fast
      */
-    @Parameter(property = "maven.clean.fastMode", defaultValue = FAST_MODE_BACKGROUND)
+    @Parameter(property = "maven.clean.fastMode", defaultValue = "background")
     private String fastMode;
 
+    /**
+     * The current session. May be null during some tests.
+     */
     @Inject
     private Session session;
+
+    /**
+     * The current project instance.
+     */
+    @Inject
+    protected Project project;
 
     /**
      * The service to use for creating include and exclude filters.
@@ -253,25 +258,22 @@ public class CleanMojo implements org.apache.maven.api.plugin.Mojo {
                 session != null ? session.getSystemProperties().get("maven.multiModuleProjectDirectory") : null;
 
         @SuppressWarnings("LocalVariableHidesMemberVariable")
-        final Path fastDir;
-        if (fast && this.fastDir != null) {
+        Path fastDir = null;
+
+        @SuppressWarnings("LocalVariableHidesMemberVariable")
+        FastMode fastMode = null;
+        if (fast) {
+            fastMode = FastMode.caseInsensitiveValueOf(this.fastMode);
             fastDir = this.fastDir;
-        } else if (fast && multiModuleProjectDirectory != null) {
-            fastDir = Path.of(multiModuleProjectDirectory, "target", ".clean");
-        } else {
-            fastDir = null;
-            if (fast) {
-                logger.warn("Fast clean requires maven 3.3.1 or newer, "
-                        + "or an explicit directory to be specified with the 'fastDir' configuration of "
-                        + "this plugin, or the 'maven.clean.fastDir' user property to be set.");
+            if (fastDir == null) {
+                if (multiModuleProjectDirectory != null) {
+                    fastDir = Path.of(multiModuleProjectDirectory, "target", ".clean");
+                } else {
+                    logger.warn("Fast clean requires maven 3.3.1 or newer, "
+                            + "or an explicit directory to be specified with the 'fastDir' configuration of "
+                            + "this plugin, or the 'maven.clean.fastDir' user property to be set.");
+                }
             }
-        }
-        if (fast
-                && !FAST_MODE_BACKGROUND.equals(fastMode)
-                && !FAST_MODE_AT_END.equals(fastMode)
-                && !FAST_MODE_DEFER.equals(fastMode)) {
-            throw new IllegalArgumentException("Illegal value '" + fastMode + "' for fastMode. Allowed values are '"
-                    + FAST_MODE_BACKGROUND + "', '" + FAST_MODE_AT_END + "' and '" + FAST_MODE_DEFER + "'.");
         }
         final var cleaner = new Cleaner(
                 session,
@@ -286,9 +288,7 @@ public class CleanMojo implements org.apache.maven.api.plugin.Mojo {
                 retryOnError);
         try {
             for (Path directoryItem : getDirectories()) {
-                if (directoryItem != null) {
-                    cleaner.delete(directoryItem);
-                }
+                cleaner.delete(directoryItem);
             }
             if (filesets != null) {
                 for (Fileset fileset : filesets) {
@@ -313,16 +313,37 @@ public class CleanMojo implements org.apache.maven.api.plugin.Mojo {
     }
 
     /**
-     * Gets the directories to clean (if any). The returned array may contain null entries.
-     *
-     * @return The directories to clean or an empty array if none, never {@code null}.
+     * {@return the default directories to clean, or an empty list if none}
+     * The list includes the directories specified in both the Maven 3 and Maven 4 ways.
+     * Null items and redundant directories (children of other items) are omitted.
      */
-    private Path[] getDirectories() {
-        Path[] directories;
+    private List<Path> getDirectories() {
         if (excludeDefaultDirectories) {
-            directories = new Path[0];
-        } else {
-            directories = new Path[] {directory, outputDirectory, testOutputDirectory, reportDirectory};
+            return List.of();
+        }
+
+        // Directories declared in the Maven 3 way.
+        var directories = new ArrayList<Path>(Arrays.asList(directory, outputDirectory, testOutputDirectory));
+
+        // Directories declared in the Maven 4 way, with <source> elements.
+        if (project != null && session != null) {
+            ProjectManager projectManager = session.getService(ProjectManager.class);
+            if (projectManager != null) {
+                projectManager.getSourceRoots(project).forEach(
+                        (source) -> source.targetPath().ifPresent(
+                                (target) -> directories.add(target)));
+            }
+        }
+
+        // Remove redundancies before deletion.
+        directories.removeIf(Objects::isNull);
+        for (int i = 0; i < directories.size(); i++) {
+            final Path prefix = directories.get(i);
+            for (int j = directories.size(); --j >= 0;) {
+                if (j != i && directories.get(j).startsWith(prefix)) {
+                    directories.remove(j); // Keep only the base directories.
+                }
+            }
         }
         return directories;
     }
